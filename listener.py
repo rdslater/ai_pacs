@@ -1,23 +1,25 @@
 """
 listener.py
 
-Basic DICOM Storage SCP for the ai_pacs project.
+DICOM Storage SCP for the ai_pacs project.
 
-Pipeline (v2):
+Pipeline:
 
-    Orthanc (Docker) --C-STORE--> listener.py --segment--> DICOM-SEG --C-STORE--> Orthanc
+    Orthanc (Docker) --C-STORE--> listener.py --inference.run_inference()--> DICOM-SEG --C-STORE--> Orthanc
 
 Orthanc is configured to forward newly received instances to this
-listener as a DICOM "modality". listener.py receives each image
-instance, runs a placeholder "segmentation" on its pixel data, packages
-the result as a proper DICOM Segmentation object (SOP Class
-"Segmentation Storage") referencing the source image, and stores that
-SEG object back into Orthanc.
+listener as a DICOM "modality". listener.py receives each 2D image
+instance, runs it through the real inference pipeline in
+inference.py (eye-side classification -> optic disc detection ->
+crop -> segmentation), packages the resulting mask as a proper DICOM
+Segmentation object (SOP Class "Segmentation Storage") referencing
+the source image, and stores that SEG object back into Orthanc. A QA
+screenshot (the crop with the mask overlaid) is also saved locally
+for review.
 
-`run_inference()` is where a real trained model gets plugged in later.
-Right now it's a stand-in: a simple intensity threshold, just to prove
-the receive -> infer -> package-as-SEG -> send pipeline works
-end-to-end before any real model exists.
+Model checkpoints referenced by inference.py are assumed to already
+be present in the deployment environment -- see inference.py's
+module docstring and README.md for what's needed.
 
 Run:
     python listener.py
@@ -28,7 +30,9 @@ forward/route studies. See README.md for setup steps.
 """
 
 import logging
+import os
 
+import cv2
 import numpy as np
 from pydicom import Dataset
 from pydicom.sr.coding import Code
@@ -37,6 +41,8 @@ from pynetdicom import AE, evt, AllStoragePresentationContexts
 from pynetdicom.sop_class import Verification
 
 import highdicom as hd
+
+from inference import InferenceUnavailableError, run_inference
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -56,9 +62,12 @@ ORTHANC_PORT = 4242
 
 # Identifies this software as the "device" that created the SEG object.
 MANUFACTURER = "ai_pacs"
-MODEL_NAME = "placeholder-threshold-seg"
-SOFTWARE_VERSION = "0.1.0"
+MODEL_NAME = "ai_pacs-eye-segmentation"
+SOFTWARE_VERSION = "0.2.0"
 DEVICE_SERIAL_NUMBER = "ai_pacs-listener"
+
+# Where QA overlay screenshots get saved (one per processed instance).
+SCREENSHOT_DIR = "./screenshots"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,35 +77,19 @@ logger = logging.getLogger("ai_pacs.listener")
 
 
 # --------------------------------------------------------------------------
-# Inference (placeholder)
-# --------------------------------------------------------------------------
-
-def run_inference(pixel_array: np.ndarray) -> np.ndarray:
-    """Produce a binary segmentation mask for a single 2D image.
-
-    STAND-IN IMPLEMENTATION. This just thresholds the brightest 25% of
-    pixels -- it is not a real segmentation and has no clinical
-    meaning. It exists purely to exercise the pipeline (receive ->
-    infer -> package as DICOM-SEG -> send) before a trained model is
-    wired in here.
-
-    Replace this function's body with real model inference. It should
-    keep taking a 2D numpy array and returning a same-shape binary
-    (0/1) numpy array.
-    """
-    threshold = np.percentile(pixel_array, 75)
-    return (pixel_array > threshold).astype(np.uint8)
-
-
-# --------------------------------------------------------------------------
 # DICOM-SEG packaging
 # --------------------------------------------------------------------------
 
-def build_segmentation(source_ds: Dataset, mask: np.ndarray) -> hd.seg.Segmentation:
+def build_segmentation(
+    source_ds: Dataset,
+    mask: np.ndarray,
+    eye_label: str,
+    yolo_confidence: float,
+) -> hd.seg.Segmentation:
     """Wrap a binary mask + its source image into a DICOM Segmentation object."""
     segment_description = hd.seg.SegmentDescription(
         segment_number=1,
-        segment_label="ai_pacs placeholder ROI",
+        segment_label=f"ai_pacs ROI ({eye_label} eye)",
         segmented_property_category=Code("91723000", "SCT", "Anatomical structure"),
         segmented_property_type=Code("91723000", "SCT", "Anatomical structure"),
         algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
@@ -120,8 +113,16 @@ def build_segmentation(source_ds: Dataset, mask: np.ndarray) -> hd.seg.Segmentat
         manufacturer_model_name=MODEL_NAME,
         software_versions=SOFTWARE_VERSION,
         device_serial_number=DEVICE_SERIAL_NUMBER,
-        content_description="ai_pacs placeholder segmentation",
+        content_description=f"ai_pacs segmentation ({eye_label} eye, yolo_conf={yolo_confidence})",
     )
+
+
+def save_screenshot(sop_instance_uid: str, screenshot: np.ndarray) -> str:
+    """Saves the QA overlay screenshot to disk, returns the path."""
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    path = os.path.join(SCREENSHOT_DIR, f"{sop_instance_uid}.jpg")
+    cv2.imwrite(path, screenshot)
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -168,23 +169,37 @@ def handle_store(event):
         logger.warning("Instance %s has no PixelData, skipping (not an image)", ds.SOPInstanceUID)
         return 0x0000
 
-    pixel_array = ds.pixel_array
-    if pixel_array.ndim != 2:
+    if ds.pixel_array.ndim != 2:
         logger.warning(
             "Instance %s is not a single 2D frame (shape %s), skipping -- "
             "multi-frame/3D support is not implemented yet",
-            ds.SOPInstanceUID, pixel_array.shape,
+            ds.SOPInstanceUID, ds.pixel_array.shape,
         )
         return 0x0000
 
     try:
-        mask = run_inference(pixel_array)
-        seg = build_segmentation(ds, mask)
-        send_to_orthanc(seg)
+        result = run_inference(ds)
+    except InferenceUnavailableError as e:
+        # Expected "nothing found" outcome for some images -- not a failure.
+        logger.info("No result for instance %s: %s", ds.SOPInstanceUID, e)
+        return 0x0000
     except Exception:
-        logger.exception("Failed to process/forward instance %s", ds.SOPInstanceUID)
+        logger.exception("Inference failed for instance %s", ds.SOPInstanceUID)
         # 0xC001: Unable to process -- tells the sender something went wrong,
         # but we still ack receipt rather than dropping the association.
+        return 0xC001
+
+    screenshot_path = save_screenshot(ds.SOPInstanceUID, result.screenshot)
+    logger.info(
+        "Instance %s: eye=%s, yolo_conf=%s, crop_box=%s, screenshot=%s",
+        ds.SOPInstanceUID, result.eye_label, result.yolo_confidence, result.crop_box, screenshot_path,
+    )
+
+    try:
+        seg = build_segmentation(ds, result.mask, result.eye_label, result.yolo_confidence)
+        send_to_orthanc(seg)
+    except Exception:
+        logger.exception("Failed to package/forward SEG for instance %s", ds.SOPInstanceUID)
         return 0xC001
 
     return 0x0000  # Success
