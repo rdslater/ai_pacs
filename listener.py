@@ -169,11 +169,18 @@ def handle_store(event):
         logger.warning("Instance %s has no PixelData, skipping (not an image)", ds.SOPInstanceUID)
         return 0x0000
 
-    if ds.pixel_array.ndim != 2:
+    # Only reject genuinely multi-frame instances here. Don't use
+    # pixel_array.ndim for this check -- a single-frame color image
+    # (SamplesPerPixel=3, e.g. RGB fundus photos) decodes to a 3D
+    # array (rows, cols, 3), which is a single frame, not multi-frame.
+    # NumberOfFrames is the actual DICOM attribute for frame count and
+    # correctly treats color and grayscale single-frame images the
+    # same way.
+    num_frames = int(getattr(ds, "NumberOfFrames", 1) or 1)
+    if num_frames != 1:
         logger.warning(
-            "Instance %s is not a single 2D frame (shape %s), skipping -- "
-            "multi-frame/3D support is not implemented yet",
-            ds.SOPInstanceUID, ds.pixel_array.shape,
+            "Instance %s has %d frames, skipping -- multi-frame support is not implemented yet",
+            ds.SOPInstanceUID, num_frames,
         )
         return 0x0000
 
