@@ -1,0 +1,4 @@
+pydicom>=2.4
+pynetdicom>=2.0
+highdicom>=0.24
+numpy>=1.24
