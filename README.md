@@ -168,14 +168,14 @@ send the SEG back.
 This is deliberately the smallest possible working slice. Next steps,
 roughly in order:
 
-1. Automate the Orthanc -> listener forwarding (Orthanc Lua script
+1. ~~Automate the Orthanc -> listener forwarding (Orthanc Lua script
    `OnStableStudy`/`OnStoredInstance` calling `SendToModality`, or the
    Orthanc auto-routing plugin) so instances flow through without a
-   manual "Send to modality" click. (DONE)
-2. Validate the real model checkpoints end-to-end (this was built and
+   manual "Send to modality" click.~~ 
+2. ~~Validate the real model checkpoints end-to-end (this was built and
    smoke-tested with stand-in/mocked models -- no checkpoints were
-   available in the environment this was written in). (DONE)
-3. Handle multi-frame/3D source images, not just single 2D frames. (TESTING)
+   available in the environment this was written in).~~
+3. Handle multi-frame/3D source images, not just single 2D frames. IN PROGRESS-TESTING
 4. Add error handling / retry logic for the outbound C-STORE.
 5. Containerize `listener.py` (with model weights) so it runs
    alongside Orthanc via `docker-compose`.
