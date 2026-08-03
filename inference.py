@@ -141,16 +141,35 @@ def dicom_to_pil(ds: pydicom.Dataset) -> Image.Image:
     if img.size == 0:
         raise ValueError("Empty pixel array")
 
+    # 1. Remove extra single-dimensional entries (e.g., shape (1, H, W) -> (H, W))
+    img = np.squeeze(img)
+
+    # 2. Invert MONOCHROME1 grayscale if applicable
     if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
         img = img.max() - img
 
-    img = img - img.min()
-    if img.max() > 0:
-        img = img / img.max()
-    img = (img * 255).astype(np.uint8)
+    # 3. Min-Max Normalize to [0, 255] uint8
+    img_min = img.min()
+    img_max = img.max()
+    if img_max > img_min:
+        img = (img - img_min) / (img_max - img_min) * 255.0
+    else:
+        img = np.zeros_like(img)
+        
+    img = img.astype(np.uint8)
 
+    # 4. Handle conversion to 3-channel RGB for PIL
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.ndim == 3 and img.shape[-1] == 1:  # (H, W, 1)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.ndim == 3 and img.shape[-1] == 4:  # RGBA
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+    elif img.ndim == 3 and img.shape[-1] == 3:  # Already RGB (e.g. YBR or RGB DICOM)
+        # Handle BGR/YBR DICOMs if needed, or leave as RGB
+        pass
+    else:
+        raise ValueError(f"Unsupported image shape after squeeze: {img.shape}")
 
     return Image.fromarray(img)
 

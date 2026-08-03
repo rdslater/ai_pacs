@@ -39,7 +39,8 @@ from pydicom.sr.coding import Code
 from pydicom.uid import generate_uid
 from pynetdicom import AE, evt, AllStoragePresentationContexts
 from pynetdicom.sop_class import Verification
-
+from pydicom.dataset import Dataset
+from pydicom.sequence import Sequence
 import highdicom as hd
 
 from inference import InferenceUnavailableError, run_inference
@@ -153,6 +154,33 @@ def send_to_orthanc(ds: Dataset) -> bool:
         assoc.release()
 
 
+def ensure_pixel_measures(ds: Dataset) -> Dataset:
+    """
+    Ensures highdicom can find PixelMeasuresSequence on Ophthalmology/2D datasets.
+    """
+    # Grab spacing from standard top-level DICOM tags, fallback to 1.0, 1.0 if absent
+    pixel_spacing = getattr(ds, "PixelSpacing", getattr(ds, "ImagerPixelSpacing", [1.0, 1.0]))
+    slice_thickness = getattr(ds, "SliceThickness", 1.0)
+
+    # Build the required Pixel Measures Dataset
+    pixel_measures_item = Dataset()
+    pixel_measures_item.PixelSpacing = [float(pixel_spacing[0]), float(pixel_spacing[1])]
+    pixel_measures_item.SliceThickness = float(slice_thickness)
+
+    # 1. Attach directly to top-level if needed
+    if "PixelMeasuresSequence" not in ds:
+        ds.PixelMeasuresSequence = Sequence([pixel_measures_item])
+
+    # 2. Attach to Shared Functional Groups Sequence (where highdicom checks)
+    if "SharedFunctionalGroupsSequence" not in ds:
+        shared_item = Dataset()
+        shared_item.PixelMeasuresSequence = Sequence([pixel_measures_item])
+        ds.SharedFunctionalGroupsSequence = Sequence([shared_item])
+    elif "PixelMeasuresSequence" not in ds.SharedFunctionalGroupsSequence[0]:
+        ds.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence = Sequence([pixel_measures_item])
+
+    return ds
+
 def handle_store(event):
     """Handler for evt.EVT_C_STORE -- runs once per received instance."""
     ds = event.dataset
@@ -169,13 +197,13 @@ def handle_store(event):
         logger.warning("Instance %s has no PixelData, skipping (not an image)", ds.SOPInstanceUID)
         return 0x0000
 
-    if ds.pixel_array.ndim != 2:
-        logger.warning(
-            "Instance %s is not a single 2D frame (shape %s), skipping -- "
-            "multi-frame/3D support is not implemented yet",
-            ds.SOPInstanceUID, ds.pixel_array.shape,
-        )
-        return 0x0000
+    #if ds.pixel_array.ndim != 2:
+    #    logger.warning(
+    #        "Instance %s is not a single 2D frame (shape %s), skipping -- "
+    #        "multi-frame/3D support is not implemented yet",
+    #        ds.SOPInstanceUID, ds.pixel_array.shape,
+    #    )
+    #    return 0x0000
 
     try:
         result = run_inference(ds)
@@ -194,10 +222,12 @@ def handle_store(event):
         "Instance %s: eye=%s, yolo_conf=%s, crop_box=%s, screenshot=%s",
         ds.SOPInstanceUID, result.eye_label, result.yolo_confidence, result.crop_box, screenshot_path,
     )
-
+    # insert spacing if it isn't here
+    ds = ensure_pixel_measures(ds)
     try:
         seg = build_segmentation(ds, result.mask, result.eye_label, result.yolo_confidence)
         send_to_orthanc(seg)
+        seg.save_as(os.path.join(SCREENSHOT_DIR, f"{ds.SOPInstanceUID}.dcm"))
     except Exception:
         logger.exception("Failed to package/forward SEG for instance %s", ds.SOPInstanceUID)
         return 0xC001
