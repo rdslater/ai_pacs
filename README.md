@@ -175,7 +175,7 @@ roughly in order:
 2. ~~Validate the real model checkpoints end-to-end (this was built and
    smoke-tested with stand-in/mocked models -- no checkpoints were
    available in the environment this was written in).~~
-3. Handle multi-frame/3D source images, not just single 2D frames. IN PROGRESS-TESTING
+3. ~~Handle multi-frame/3D source images, not just single 2D frames.~~
 4. Add error handling / retry logic for the outbound C-STORE.
 5. Containerize `listener.py` (with model weights) so it runs
    alongside Orthanc via `docker-compose`.
